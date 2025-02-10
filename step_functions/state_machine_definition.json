@@ -1,0 +1,76 @@
+{
+  "Comment": "ML Pipeline State Machine",
+  "StartAt": "RunGlueJob",
+  "States": {
+    "RunGlueJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${glue_job_name}"
+      },
+      "Next": "TrainModel"
+    },
+    "TrainModel": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+      "Parameters": {
+        "TrainingJobName.$": "States.Format('TrainingJob-{}', $.Execution.StartTime)",
+        "AlgorithmSpecification": {
+          "TrainingImage": "${training_image}",
+          "TrainingInputMode": "File"
+        },
+        "RoleArn": "${sagemaker_role_arn}",
+        "InputDataConfig": [
+          {
+            "ChannelName": "train",
+            "DataSource": {
+              "S3DataSource": {
+                "S3DataType": "S3Prefix",
+                "S3Uri": "s3://${transformed_bucket}/train_transformed.parquet"
+              }
+            },
+            "ContentType": "text/csv"
+          }
+        ],
+        "OutputDataConfig": {
+          "S3OutputPath": "s3://${model_bucket}/model_output"
+        },
+        "ResourceConfig": {
+          "InstanceType": "ml.m5.xlarge",
+          "InstanceCount": 1,
+          "VolumeSizeInGB": 10
+        },
+        "StoppingCondition": {
+          "MaxRuntimeInSeconds": 3600
+        }
+      },
+      "Next": "BatchTransform"
+    },
+    "BatchTransform": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createTransformJob.sync",
+      "Parameters": {
+        "TransformJobName.$": "States.Format('TransformJob-{}', $.Execution.StartTime)",
+        "ModelName": "model-logistic-regression",
+        "TransformInput": {
+          "DataSource": {
+            "S3DataSource": {
+              "S3Uri": "s3://${inference_input_bucket}"
+            }
+          },
+          "ContentType": "text/csv"
+        },
+        "TransformOutput": {
+          "S3OutputPath": "s3://${inference_output_bucket}"
+        },
+        "TransformResources": {
+          "InstanceType": "ml.m5.xlarge",
+          "InstanceCount": 1
+        }
+      },
+      "End": true
+    }
+  }
+}
+
+  
