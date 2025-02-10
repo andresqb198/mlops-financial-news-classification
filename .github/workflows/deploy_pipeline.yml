@@ -1,0 +1,120 @@
+name: Deploy ML Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'terraform/**'
+      - 'scripts/**'
+      - '.github/workflows/deploy_pipeline.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'terraform/**'
+      - 'scripts/**'
+      - '.github/workflows/deploy_pipeline.yml'
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/environments/dev
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: us-east-2
+      TF_VAR_project_name: amazon-reviews
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.0"
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        if: github.event_name == 'pull_request'
+        run: terraform plan -no-color
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+        continue-on-error: true
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+
+  test_pipeline:
+    name: Test ML Pipeline
+    needs: terraform
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-2
+
+      - name: Upload Test Data
+        run: |
+          aws s3 cp test_data/train.csv s3://amazon-reviews-raw-${{ secrets.AWS_ACCOUNT_ID }}-us-east-2/train.csv
+
+      - name: Start Pipeline Execution
+        run: |
+          EXECUTION_ARN=$(aws stepfunctions start-execution \
+            --state-machine-arn arn:aws:states:us-east-2:${{ secrets.AWS_ACCOUNT_ID }}:stateMachine:amazon-reviews-pipeline \
+            --query 'executionArn' \
+            --output text)
+          
+          echo "EXECUTION_ARN=$EXECUTION_ARN" >> $GITHUB_ENV
+
+      - name: Wait for Pipeline Completion
+        run: |
+          while true; do
+            STATUS=$(aws stepfunctions describe-execution \
+              --execution-arn ${{ env.EXECUTION_ARN }} \
+              --query 'status' \
+              --output text)
+            
+            if [ "$STATUS" = "SUCCEEDED" ]; then
+              echo "Pipeline execution completed successfully"
+              break
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "TIMED_OUT" ] || [ "$STATUS" = "ABORTED" ]; then
+              echo "Pipeline execution failed with status: $STATUS"
+              exit 1
+            fi
+            
+            echo "Pipeline still running... Current status: $STATUS"
+            sleep 30
+          done
